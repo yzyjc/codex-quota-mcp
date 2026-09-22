@@ -161,7 +161,10 @@ def build_brief(previous: dict[str, Any] | None, observations: list[dict[str, An
         "resource_brief": {
             "primary_remaining_percent": current.get("primary_remaining_percent"),
             "primary_reset_at": current.get("primary_reset_at_iso"),
+            "primary_window_minutes": current.get("primary_window_minutes"),
             "weekly_remaining_percent": current.get("secondary_remaining_percent"),
+            "weekly_reset_at": current.get("secondary_reset_at_iso"),
+            "weekly_window_minutes": current.get("secondary_window_minutes"),
             "observed_consumption": {
                 "5m": sliding_burn(observations, current, 5),
                 "15m": sliding_burn(observations, current, 15),
@@ -212,6 +215,9 @@ def get_quota(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         "primary_remaining_percent": primary.get("remaining_percent") if primary else None,
         "secondary_remaining_percent": secondary.get("remaining_percent") if secondary else None,
         "primary_reset_at_iso": primary.get("resets_at_iso") if primary else None,
+        "primary_window_minutes": primary.get("window_minutes") if primary else None,
+        "secondary_reset_at_iso": secondary.get("resets_at_iso") if secondary else None,
+        "secondary_window_minutes": secondary.get("window_minutes") if secondary else None,
     }
     elapsed = now.timestamp() - previous_report.get("timestamp", 0) if previous_report else None
     primary_delta = None
@@ -247,6 +253,9 @@ def get_quota(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
             "primary_remaining_percent": primary.get("remaining_percent") if primary else None,
             "secondary_remaining_percent": secondary.get("remaining_percent") if secondary else None,
             "primary_reset_at_iso": primary.get("resets_at_iso") if primary else None,
+            "primary_window_minutes": primary.get("window_minutes") if primary else None,
+            "secondary_reset_at_iso": secondary.get("resets_at_iso") if secondary else None,
+            "secondary_window_minutes": secondary.get("window_minutes") if secondary else None,
         }, model=model, context=context)
         windows = brief["resource_brief"]["observed_consumption"]
         brief["resource_brief"]["observed_consumption"] = {
