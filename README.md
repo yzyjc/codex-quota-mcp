@@ -21,6 +21,16 @@ Agent 应在每次开始处理新的用户请求时调用一次 `mode=task_start
 - App Server 无论成功、失败还是超时都会被清理，避免遗留子进程。
 - 历史文件使用跨进程锁和原子替换写入，减少多个 MCP 请求同时保存时互相覆盖的风险。
 
+## 模拟测试
+
+仓库包含一个假的本地 App Server 和可执行测试，覆盖四种模式、滑动窗口、低频门控、超时、stderr 诊断和历史文件边界。测试不会访问真实 Codex 账户：
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+GitHub Actions 会在 push 和 pull request 时自动运行同一套测试。
+
 ## 启动
 
 ```powershell
