@@ -121,6 +121,26 @@ def error(request_id: Any, code: int, message: str) -> None:
     send({"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}})
 
 
+def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Stop the App Server and any wrapper child process on Windows."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        proc.kill()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=3)
+
+
 def app_server_request(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run one read-only App Server request and return its JSON-RPC result."""
     command = os.environ.get("CODEX_COMMAND", "codex")
@@ -182,24 +202,26 @@ def app_server_request(method: str, params: dict[str, Any] | None = None) -> dic
                 continue
             if message_data.get("id") == 2:
                 if "error" in message_data:
-                    raise RuntimeError(message_data["error"].get("message", "App Server request failed"))
+                    terminate_process_tree(proc)
+                    stderr_text = proc.stderr.read() if proc.stderr else ""
+                    detail = (stderr_text or "").strip()[-1000:]
+                    suffix = f"; stderr: {detail}" if detail else ""
+                    raise RuntimeError(message_data["error"].get("message", "App Server request failed") + suffix)
                 result = message_data.get("result", {})
                 break
         if result is None:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=3)
+            terminate_process_tree(proc)
             stderr_text = proc.stderr.read() if proc.stderr else ""
             detail = (stderr_text or "").strip()[-1000:]
             suffix = f": {detail}" if detail else ""
             raise RuntimeError(f"Codex App Server timed out or returned no response within {timeout_seconds:g}s{suffix}")
         return result
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=3)
+        terminate_process_tree(proc)
         if proc.stdin:
             proc.stdin.close()
+        if proc.stdout:
+            proc.stdout.close()
         if proc.stderr:
             proc.stderr.close()
         reader.join(timeout=0.2)
