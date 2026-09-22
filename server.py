@@ -185,14 +185,14 @@ def select_windows(mode: str) -> list[str]:
         return ["5m"]
     if mode == "30m":
         return ["30m"]
-    if mode == "conversation_start":
+    if mode == "task_start":
         return ["5m", "15m", "30m"]
     return ["15m"]
 
 
 def get_quota(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     arguments = arguments or {}
-    mode = arguments.get("mode") if arguments.get("mode") in {"5m", "15m", "30m", "conversation_start"} else "15m"
+    mode = arguments.get("mode") if arguments.get("mode") in {"5m", "15m", "30m", "task_start"} else "15m"
     model = arguments.get("model") if isinstance(arguments.get("model"), str) else None
     context = arguments.get("context_used_percent")
     if not isinstance(context, (int, float)):
@@ -219,7 +219,7 @@ def get_quota(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         primary_delta = snapshot["primary_used_percent"] - previous_report["primary_used_percent"]
     reset_changed = bool(previous_report and snapshot.get("primary_reset_at_iso") != previous_report.get("primary_reset_at_iso"))
     report_due = (
-        mode == "conversation_start"
+        mode == "task_start"
         or (
         previous_report is None
         or (isinstance(elapsed, (int, float)) and elapsed >= MIN_REPORT_INTERVAL_SECONDS)
@@ -258,9 +258,9 @@ def get_quota(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
 
 TOOLS = [{
     "name": "get_codex_quota",
-    "description": "Read low-frequency, model-agnostic Codex quota telemetry. Modes: 5m, 15m, 30m return one sliding window; conversation_start returns all three windows and bypasses throttling. At the beginning of every new conversation, call exactly once with mode=conversation_start. During ongoing work, use a window mode and respect report_due=false. The Agent must choose any action itself with a tiny reasoning budget; this tool never recommends an action or performs forecasting. Read-only; no tokens are returned.",
+    "description": "Read low-frequency, model-agnostic Codex quota telemetry. Modes: 5m, 15m, 30m return one sliding window; task_start returns all three windows and bypasses throttling. At the beginning of every new task or user request, call exactly once with mode=task_start, even when the same conversation continues. During ongoing work, use a window mode and respect report_due=false. The Agent must choose any action itself with a tiny reasoning budget; this tool never recommends an action or performs forecasting. Read-only; no tokens are returned.",
     "inputSchema": {"type": "object", "properties": {
-        "mode": {"type": "string", "enum": ["5m", "15m", "30m", "conversation_start"], "description": "Use conversation_start exactly once at the beginning of a new conversation; otherwise choose one observation window."},
+        "mode": {"type": "string", "enum": ["5m", "15m", "30m", "task_start"], "description": "Use task_start exactly once at the beginning of every new task or user request; otherwise choose one observation window."},
         "model": {"type": "string", "description": "Optional active model name, only if known by the caller."},
         "context_used_percent": {"type": "number", "minimum": 0, "maximum": 100, "description": "Optional current context usage, only if known by the caller."},
     }, "additionalProperties": False},
