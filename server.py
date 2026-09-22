@@ -11,9 +11,13 @@ import json
 import os
 import subprocess
 import sys
+import queue
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 SERVER_NAME = "codex-quota"
@@ -21,6 +25,8 @@ SERVER_VERSION = "0.2.0"
 MAX_OBSERVATIONS = 64
 MIN_REPORT_INTERVAL_SECONDS = 10 * 60
 REPORT_CHANGE_THRESHOLD_PP = 3
+APP_SERVER_TIMEOUT_SECONDS = 15
+HISTORY_LOCK_TIMEOUT_SECONDS = 5
 
 
 def state_path() -> Path:
@@ -31,7 +37,48 @@ def state_path() -> Path:
     return Path(root) / "CodexQuotaMCP" / "history.json"
 
 
-def load_observations() -> list[dict[str, Any]]:
+@contextmanager
+def history_lock() -> Iterator[None]:
+    """Serialize history read/modify/write operations across MCP processes."""
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    handle = open(lock_path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            deadline = time.monotonic() + HISTORY_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out waiting for quota history lock")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _load_observations_unlocked() -> list[dict[str, Any]]:
     try:
         data = json.loads(state_path().read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -41,16 +88,28 @@ def load_observations() -> list[dict[str, Any]]:
         return []
 
 
-def save_observation(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    observations = (load_observations() + [snapshot])[-MAX_OBSERVATIONS:]
-    try:
+def load_observations() -> list[dict[str, Any]]:
+    with history_lock():
+        return _load_observations_unlocked()
+
+
+def append_observation(snapshot: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Atomically read the prior report and append one bounded snapshot."""
+    with history_lock():
+        observations = _load_observations_unlocked()
+        previous_report = next((item for item in reversed(observations) if item.get("reported")), None)
+        observations = (observations + [snapshot])[-MAX_OBSERVATIONS:]
         path = state_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"observations": observations}, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        # Quota reporting remains useful even if history cannot be persisted.
-        pass
-    return observations
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps({"observations": observations}, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        return previous_report, observations
 
 
 def send(message: dict[str, Any]) -> None:
@@ -65,18 +124,17 @@ def error(request_id: Any, code: int, message: str) -> None:
 def app_server_request(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run one read-only App Server request and return its JSON-RPC result."""
     command = os.environ.get("CODEX_COMMAND", "codex")
+    timeout_seconds = float(os.environ.get("CODEX_APP_SERVER_TIMEOUT_SECONDS", APP_SERVER_TIMEOUT_SECONDS))
     proc = subprocess.Popen(
         [command, "app-server", "--stdio"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
         env=os.environ.copy(),
     )
-    assert proc.stdin is not None and proc.stdout is not None
-
     # Codex App Server uses JSON-RPC-shaped JSONL, but omits the jsonrpc field
     # on the wire (unlike MCP, which keeps it).
     messages = [
@@ -87,29 +145,64 @@ def app_server_request(method: str, params: dict[str, Any] | None = None) -> dic
         {"method": "initialized", "params": {}},
         {"id": 2, "method": method, "params": params or {}},
     ]
-    for message in messages:
-        proc.stdin.write(json.dumps(message) + "\n")
-    proc.stdin.flush()
+    payload = "".join(json.dumps(message) + "\n" for message in messages)
+    stdout_queue: queue.Queue[str | None] = queue.Queue()
 
-    result: dict[str, Any] | None = None
-    for line in proc.stdout:
-        if not line.strip():
-            continue
+    def read_stdout() -> None:
+        assert proc.stdout is not None
         try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if message.get("id") == 2:
-            if "error" in message:
-                raise RuntimeError(message["error"].get("message", "App Server request failed"))
-            result = message.get("result", {})
-            break
+            for line in proc.stdout:
+                stdout_queue.put(line)
+        finally:
+            stdout_queue.put(None)
 
-    proc.kill()
-    proc.wait(timeout=3)
-    if result is None:
-        raise RuntimeError("Codex App Server returned no response")
-    return result
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(payload)
+        proc.stdin.flush()
+        deadline = time.monotonic() + timeout_seconds
+        result: dict[str, Any] | None = None
+        raw_lines: list[str] = []
+        while time.monotonic() < deadline:
+            remaining = max(0.01, deadline - time.monotonic())
+            try:
+                line = stdout_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            raw_lines.append(line)
+            if not line.strip():
+                continue
+            try:
+                message_data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message_data.get("id") == 2:
+                if "error" in message_data:
+                    raise RuntimeError(message_data["error"].get("message", "App Server request failed"))
+                result = message_data.get("result", {})
+                break
+        if result is None:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
+            stderr_text = proc.stderr.read() if proc.stderr else ""
+            detail = (stderr_text or "").strip()[-1000:]
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"Codex App Server timed out or returned no response within {timeout_seconds:g}s{suffix}")
+        return result
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=3)
+        if proc.stdin:
+            proc.stdin.close()
+        if proc.stderr:
+            proc.stderr.close()
+        reader.join(timeout=0.2)
 
 
 def iso_time(timestamp: Any) -> str | None:
@@ -234,7 +327,7 @@ def get_quota(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         )
     )
     snapshot["reported"] = report_due
-    observations = save_observation(snapshot)
+    _, observations = append_observation(snapshot)
     response = {
         "source": "codex-app-server",
         "read_only": True,
