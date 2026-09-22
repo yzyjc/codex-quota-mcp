@@ -17,8 +17,8 @@ from typing import Any
 
 
 SERVER_NAME = "codex-quota"
-SERVER_VERSION = "0.1.0"
-MAX_OBSERVATIONS = 8
+SERVER_VERSION = "0.2.0"
+MAX_OBSERVATIONS = 64
 MIN_REPORT_INTERVAL_SECONDS = 10 * 60
 REPORT_CHANGE_THRESHOLD_PP = 3
 
@@ -131,30 +131,51 @@ def normalize_window(window: Any) -> dict[str, Any] | None:
     }
 
 
-def build_brief(previous: dict[str, Any] | None, current: dict[str, Any], *, model: str | None, context: Any) -> dict[str, Any]:
-    """Create only the short telemetry packet; the Agent owns the decision."""
+def sliding_burn(observations: list[dict[str, Any]], current: dict[str, Any], window_minutes: int) -> dict[str, Any]:
+    """Calculate observed burn from samples inside one time window."""
     now = current["timestamp"]
-    old_time = previous.get("timestamp") if previous else None
-    old_used = previous.get("primary_used_percent") if previous else None
-    new_used = current.get("primary_used_percent")
-    minutes = (now - old_time) / 60 if isinstance(old_time, (int, float)) else None
-    delta = (new_used - old_used) if isinstance(old_used, (int, float)) and isinstance(new_used, (int, float)) else None
+    cutoff = now - window_minutes * 60
+    candidates = [
+        item for item in observations
+        if isinstance(item.get("timestamp"), (int, float))
+        and item["timestamp"] >= cutoff
+        and isinstance(item.get("primary_used_percent"), (int, float))
+    ]
+    if candidates and isinstance(current.get("primary_used_percent"), (int, float)):
+        oldest = min(candidates, key=lambda item: item["timestamp"])
+        observed_minutes = (now - oldest["timestamp"]) / 60
+        delta = current["primary_used_percent"] - oldest["primary_used_percent"]
+        if observed_minutes > 0 and delta >= 0:
+            return {
+                "consumed_percent": round(delta, 2),
+                "observed_minutes": round(observed_minutes, 1),
+                "sample_count": len(candidates),
+                "consumed_percent_per_hour": round(delta * 60 / observed_minutes, 2),
+            }
+    return {"consumed_percent": None, "observed_minutes": 0, "sample_count": len(candidates)}
+
+
+def build_brief(previous: dict[str, Any] | None, observations: list[dict[str, Any]], current: dict[str, Any], *, model: str | None, context: Any) -> dict[str, Any]:
+    """Create only the short telemetry packet; the Agent owns the decision."""
     return {
         "resource_brief": {
             "primary_remaining_percent": current.get("primary_remaining_percent"),
-            "primary_burn_percent": round(delta, 2) if isinstance(delta, (int, float)) else None,
-            "observed_minutes": round(minutes, 1) if isinstance(minutes, (int, float)) else None,
-            "weekly_remaining_percent": current.get("secondary_remaining_percent"),
             "primary_reset_at": current.get("primary_reset_at_iso"),
+            "weekly_remaining_percent": current.get("secondary_remaining_percent"),
+            "observed_consumption": {
+                "5m": sliding_burn(observations, current, 5),
+                "15m": sliding_burn(observations, current, 15),
+                "30m": sliding_burn(observations, current, 30),
+            },
             "model": model,
             "context_used_percent": context,
         },
+        "telemetry_only": True,
         "telemetry_basis": "Observed changes between MCP queries; not per-turn token telemetry.",
-        "agent_owned_decision": True,
         "resource_planning_policy": (
-            "Use a very small reasoning budget. Do not forecast or optimize numerically. "
-            "Make at most one quick internal state choice (CONTINUE, REDUCE_EXPLORATION, "
-            "or CHECKPOINT_SOON), using only this telemetry, then return to the task."
+            "Use a very small reasoning budget. Do not perform extended quota analysis, "
+            "forecasting, or numerical optimization. Read this telemetry, make the minimum "
+            "local decision needed, and immediately return to the primary task."
         ),
     }
 
@@ -206,7 +227,7 @@ def get_quota(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         ),
     }
     if report_due:
-        response["brief_report"] = build_brief(previous_report, {
+        response["brief_report"] = build_brief(previous_report, observations, {
             **snapshot,
             "primary_remaining_percent": primary.get("remaining_percent") if primary else None,
             "secondary_remaining_percent": secondary.get("remaining_percent") if secondary else None,
