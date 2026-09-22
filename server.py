@@ -155,7 +155,7 @@ def sliding_burn(observations: list[dict[str, Any]], current: dict[str, Any], wi
     return {"consumed_percent": None, "observed_minutes": 0, "sample_count": len(candidates)}
 
 
-def build_brief(previous: dict[str, Any] | None, observations: list[dict[str, Any]], current: dict[str, Any], *, model: str | None, context: Any) -> dict[str, Any]:
+def build_brief(observations: list[dict[str, Any]], current: dict[str, Any], *, model: str | None, context: Any) -> dict[str, Any]:
     """Create only the short telemetry packet; the Agent owns the decision."""
     return {
         "resource_brief": {
@@ -248,7 +248,7 @@ def get_quota(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         ),
     }
     if report_due:
-        brief = build_brief(previous_report, observations, {
+        brief = build_brief(observations, {
             **snapshot,
             "primary_remaining_percent": primary.get("remaining_percent") if primary else None,
             "secondary_remaining_percent": secondary.get("remaining_percent") if secondary else None,
