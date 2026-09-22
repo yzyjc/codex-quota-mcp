@@ -1,0 +1,17 @@
+name: MCP simulation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  simulation:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run simulated App Server tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
