@@ -14,6 +14,13 @@ Agent 应在每次开始处理新的用户请求时调用一次 `mode=task_start
 
 采样发生在 MCP 被调用时，不是后台连续采样；因此 5/15/30 分钟模式返回的是对应时间窗口内已有采样点之间的观测值，实际覆盖时长由 `observed_minutes` 给出，不保证恰好覆盖完整窗口。它不是每个 token 或每个 turn 的精确遥测。工具可以接收可选字段 `model` 和 `context_used_percent`；未知时保持为空，不根据模型名称猜测消耗。
 
+## 可靠性
+
+- App Server 请求默认 15 秒超时，可通过 `CODEX_APP_SERVER_TIMEOUT_SECONDS` 调整。
+- App Server 的 stderr 会在启动失败、超时或无响应时作为截断诊断信息返回。
+- App Server 无论成功、失败还是超时都会被清理，避免遗留子进程。
+- 历史文件使用跨进程锁和原子替换写入，减少多个 MCP 请求同时保存时互相覆盖的风险。
+
 ## 启动
 
 ```powershell
